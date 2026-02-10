@@ -1,0 +1,285 @@
+<html>
+<head>
+  <base href=".">
+  <meta charset="UTF-8">
+  <title>3D Grid MMORPG World</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="placed-blocks.js"></script>
+  <script src="placed-assets.js"></script>
+  <script src="assets.js"></script>
+  <script src="block-tools.js"></script>
+</head>
+<body>
+  <div id="editor-container">
+    <div id="grid-container">
+    </div>
+  </div>
+
+  <script>
+    // Add div removal observer
+    const divRemovalObserver = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.addedNodes.length) {
+          // Check for divs added to bottom of body
+          const lastElement = document.body.lastElementChild;
+          if (lastElement && lastElement.tagName === 'DIV' && 
+              !['editor-container', 'grid-container'].includes(lastElement.id)) {
+            lastElement.style.display = 'none'; // Hide the div
+            // Optional: remove instead of hide
+            // lastElement.remove();
+          }
+        }
+      });
+    });
+
+    // Start observing body for changes
+    divRemovalObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    let room = new WebsimSocket();
+    let peers = {};
+    let scene, camera, renderer, controls;
+    let gridBlocks = {};
+    let groundPlane;
+    let loadedModels = [];
+    let placedAssets = [];
+    const loader = new THREE.GLTFLoader();
+
+    // Add camera direction exposure for iframe parent
+    window.getCameraDirection = () => {
+      const x = camera.position.x;
+      const z = camera.position.z;
+      let angle = Math.atan2(z, x) * 180 / Math.PI;
+      // Ensure positive value
+      angle = angle < 0 ? angle + 360 : angle;
+      return angle;
+    };
+
+    // Listen for messages from parent
+    window.addEventListener('message', (event) => {
+      if (event.data === 'getCameraDirection') {
+        // Send camera direction back to parent
+        window.parent.postMessage({
+          type: 'cameraDirection',
+          direction: window.getCameraDirection()
+        }, '*');
+      }
+    });
+
+    function init() {
+      scene = new THREE.Scene();
+      
+      // Add skybox
+      const skyboxGeometry = new THREE.BoxGeometry(1000, 1000, 1000);
+      const skyboxMaterial = new THREE.MeshBasicMaterial({
+        color: 0x87CEEB, // Light sky blue
+        side: THREE.BackSide
+      });
+      const skybox = new THREE.Mesh(skyboxGeometry, skyboxMaterial);
+      scene.add(skybox);
+
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      renderer = new THREE.WebGLRenderer({
+        antialias: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.getElementById('grid-container').appendChild(renderer.domElement);
+      
+      // Set initial camera position
+      camera.position.set(20, 20, 20);
+      camera.lookAt(new THREE.Vector3(0, 0, 0));
+      
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;  
+      controls.dampingFactor = 0.05;
+      controls.enabled = true;
+
+      // Add control change listener to send updates during manual control
+      controls.addEventListener('change', () => {
+        // Send camera direction update to parent if in iframe
+        if (window !== window.parent) {
+          window.parent.postMessage({
+            type: 'cameraDirection',
+            direction: window.getCameraDirection()
+          }, '*');
+        }
+      });
+
+      // Ground plane
+      const groundGeometry = new THREE.PlaneGeometry(32, 32);
+      const groundMaterial = new THREE.MeshBasicMaterial({
+        visible: false, 
+        side: THREE.DoubleSide
+      });
+      groundPlane = new THREE.Mesh(groundGeometry, groundMaterial);
+      groundPlane.rotation.x = -Math.PI / 2;
+      groundPlane.position.set(0, 0, 0);
+      scene.add(groundPlane);
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(10, 20, 10);
+      scene.add(directionalLight);
+
+      window.addEventListener('resize', onWindowResize);
+
+      // Load level data
+      fetch('level.json')
+        .then(response => response.json())
+        .then(levelData => {
+          loadLevel(levelData);
+        })
+        .catch(error => {
+          console.error('Error loading level:', error);
+        });
+    }
+
+
+
+    function loadLevel(levelData) {
+      // Clear existing scene
+      Object.keys(gridBlocks).forEach(key => removeBlock(key));
+      gridBlocks = {};
+      placedAssets.forEach(asset => scene.remove(asset.model));
+      placedAssets = [];
+
+      // Load blocks
+      levelData.blocks?.forEach(block => {
+        const newBlock = addBlock(new THREE.Vector3(block.x, block.y, block.z), block.type || 'half');
+        if (block.orientation) {
+          let rotation = 0;
+          switch (block.orientation) {
+            case 'east':
+              rotation = Math.PI / 2;
+              break;
+            case 'south':
+              rotation = Math.PI;
+              break;
+            case 'west':
+              rotation = -Math.PI / 2;
+              break;
+          }
+          newBlock.rotation.y = rotation;
+          newBlock.userData.orientation = block.orientation;
+        }
+        if (block.color) {
+          newBlock.material.color.set('#' + block.color);
+        }
+        if (block.textureUrl) {
+          const textureLoader = new THREE.TextureLoader();
+          textureLoader.load(block.textureUrl, texture => {
+            texture.userData = { url: block.textureUrl };
+            newBlock.material.map = texture;
+            newBlock.material.needsUpdate = true;
+          });
+        }
+        gridBlocks[`${block.x},${block.y},${block.z}`] = newBlock;
+      });
+
+      // Load assets
+      levelData.assets?.forEach(assetData => {
+        loader.load(assetData.url, gltf => {
+          const model = gltf.scene;
+          model.position.set(assetData.position.x, assetData.position.y, assetData.position.z);
+          model.rotation.set(assetData.rotation.x, assetData.rotation.y, assetData.rotation.z);
+          model.scale.set(assetData.scale.x, assetData.scale.y, assetData.scale.z);
+          model.userData.url = assetData.url;
+          model.userData.name = assetData.name;
+          scene.add(model);
+          placedAssets.push({
+            id: assetData.id,
+            model: model,
+            position: model.position.clone(),
+            url: assetData.url,
+            name: assetData.name
+          });
+        });
+      });
+    }
+
+    function addBlock(position, blockType = 'half') {
+      let geometry;
+      switch (blockType) {
+        case 'full':
+          geometry = new THREE.BoxGeometry(1, 1, 1);
+          break;
+        case 'stair':
+          geometry = createStairGeometry();
+          break;
+        default:
+          geometry = new THREE.BoxGeometry(1, 0.5, 1);
+      }
+
+      const material = new THREE.MeshPhongMaterial({ color: 0x8888ff });
+      const block = new THREE.Mesh(geometry, material);
+      block.userData.blockType = blockType;
+
+      const adjustedX = position.x + 0.5;
+      const adjustedY = position.y + (blockType === 'full' ? 0.5 : 
+                                    blockType === 'half' ? 0.25 : 
+                                    blockType === 'stair' ? 0.25 : 0.25);
+      const adjustedZ = position.z + 0.5;
+
+      block.position.set(adjustedX, adjustedY, adjustedZ);
+      block.userData.key = `${position.x},${position.y},${position.z}`;
+      
+      scene.add(block);
+      return block;
+    }
+
+    function createStairGeometry() {
+      const geometry = new THREE.BufferGeometry();
+      const vertices = new Float32Array([
+        -0.5, 0.0, 0.5,   0.5, 0.0, 0.5,   0.5, 0.25, 0.5,  -0.5, 0.25, 0.5,
+        -0.5, 0.0, -0.5,  0.5, 0.0, -0.5,  0.5, 0.25, -0.5, -0.5, 0.25, -0.5,
+        -0.5, 0.25, 0.5,  0.0, 0.25, 0.5,  0.0, 0.5, 0.5,   -0.5, 0.5, 0.5,
+        -0.5, 0.25, -0.5, 0.0, 0.25, -0.5, 0.0, 0.5, -0.5,  -0.5, 0.5, -0.5
+      ]);
+      const indices = new Uint16Array([
+        0, 1, 2,    0, 2, 3,    4, 5, 6,    4, 6, 7,
+        0, 4, 7,    0, 7, 3,    1, 5, 6,    1, 6, 2,
+        3, 2, 6,    3, 6, 7,    0, 1, 5,    0, 5, 4,
+        8, 9, 10,   8, 10, 11,  12, 13, 14, 12, 14, 15,
+        8, 12, 15,  8, 15, 11,  9, 13, 14,  9, 14, 10,
+        11, 10, 14, 11, 14, 15, 8, 9, 13,   8, 13, 12
+      ]);
+      geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+      geometry.computeVertexNormals();
+      return geometry;
+    }
+
+    function removeBlock(key) {
+      scene.children.forEach(child => {
+        if (child.userData.key === key) {
+          scene.remove(child);
+          delete gridBlocks[key];
+        }
+      });
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    init();
+    animate();
+  </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
